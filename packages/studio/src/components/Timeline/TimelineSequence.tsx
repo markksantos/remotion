@@ -1,5 +1,4 @@
 import type {TimelineTrackData} from '@remotion/sdk';
-import {CanvasInternals} from '@remotion/sdk';
 import {stringifySequenceSubscriptionKey} from '@remotion/studio-shared';
 import type {WaveformVolume} from '@remotion/timeline-utils';
 import React, {
@@ -73,7 +72,6 @@ import {
 	getKeyframePlaybackRate,
 } from './get-timeline-keyframes';
 import {getTimelineMediaStartFrame} from './get-timeline-media-start-frame';
-import {getTimelineSequenceNaturalDuration} from './get-timeline-sequence-natural-duration';
 import {getTimelineSequenceVisibleLayout} from './get-timeline-sequence-visible-layout';
 import {getCurrentFrame} from './imperative-state';
 import {LoopedTimelineIndicator} from './LoopedTimelineIndicators';
@@ -119,8 +117,11 @@ import {useAssetTimelineContextMenu} from './use-asset-timeline-context-menu';
 import {useDeleteTimelineItems} from './use-delete-timeline-items';
 import {useOpenSequenceInApps} from './use-open-sequence-in-apps';
 import {getSequenceFreezeFrameMenuItem} from './use-sequence-freeze-frame-menu-item';
+import {
+	useTimelineSequenceNaturalDuration,
+	useTimelineSequenceRegistry,
+} from './use-timeline-sequence-registry';
 
-const {sortItemsByCommitOrder} = CanvasInternals;
 const NEGATIVE_START_BORDER_WIDTH = 1;
 const EDGE_DRAG_HIGHLIGHT_WIDTH = 12;
 const MIN_SECONDARY_LEFT_EDGE_ACTION_WIDTH = 32;
@@ -750,7 +751,9 @@ const TimelineSequenceInner: React.FC<{
 	// if that is the case, it needs to be asynchronously determined
 
 	const video = Internals.useVideo();
-	const sequences = Internals.useSequenceManagerSequences();
+	const sequencesRef = useContext(Internals.SequenceManagerRefContext);
+	const registryEntry = useTimelineSequenceRegistry(s.id);
+	const originalSequence = registryEntry?.sequence ?? null;
 	const overrideIdToNodePathMappingsRef = useContext(
 		OverrideIdToNodePathMappingsRefContext,
 	);
@@ -778,29 +781,14 @@ const TimelineSequenceInner: React.FC<{
 			setActiveEdgeHighlight,
 		);
 	}, [edgeHighlightController, nodePath]);
-	const cascadingSequenceComponentIdentity = isCascadingSequence(s)
-		? s.controls?.componentIdentity
-		: null;
-	const adjacentCascadingSequences = useMemo(() => {
-		if (!cascadingSequenceComponentIdentity) {
-			return {previous: null, next: null};
-		}
-
-		const siblings = sortItemsByCommitOrder(
-			sequences.filter(
-				(candidate) =>
-					candidate.parent === s.parent &&
-					candidate.controls?.componentIdentity ===
-						cascadingSequenceComponentIdentity,
-			),
-			(candidate) => candidate.timelineOrder,
-		);
-		const index = siblings.findIndex((candidate) => candidate.id === s.id);
-		return {
-			previous: siblings[index - 1] ?? null,
-			next: siblings[index + 1] ?? null,
-		};
-	}, [cascadingSequenceComponentIdentity, s.id, s.parent, sequences]);
+	const naturalSequenceDuration = useTimelineSequenceNaturalDuration({
+		sequenceId: s.id,
+		enabled:
+			activeEdgeHighlight !== null && activeEdgeHighlight !== 'source-only',
+	});
+	const previousCascadingSequenceId = registryEntry?.previousSequenceId ?? null;
+	const previousCascadingOverrideId = registryEntry?.previousOverrideId ?? null;
+	const nextCascadingOverrideId = registryEntry?.nextOverrideId ?? null;
 	const startEdgeDrag = useCallback(
 		(
 			edge: TimelineEdgeHighlightEdge,
@@ -818,11 +806,10 @@ const TimelineSequenceInner: React.FC<{
 			}
 
 			if (highlightAdjacent) {
-				const adjacent =
+				const adjacentOverrideId =
 					edge === 'left'
-						? adjacentCascadingSequences.previous
-						: adjacentCascadingSequences.next;
-				const adjacentOverrideId = adjacent?.controls?.overrideId;
+						? previousCascadingOverrideId
+						: nextCascadingOverrideId;
 				const adjacentNodePath = adjacentOverrideId
 					? overrideIdToNodePathMappingsRef.current[adjacentOverrideId]
 					: null;
@@ -846,7 +833,8 @@ const TimelineSequenceInner: React.FC<{
 			);
 		},
 		[
-			adjacentCascadingSequences,
+			previousCascadingOverrideId,
+			nextCascadingOverrideId,
 			overrideIdToNodePathMappingsRef,
 			edgeHighlightController,
 		],
@@ -945,18 +933,13 @@ const TimelineSequenceInner: React.FC<{
 	}, [originalLocation]);
 
 	const {propStatuses} = useContext(Internals.VisualModePropStatusesContext);
-	const {getDragOverrides} = useContext(
-		Internals.VisualModeDragOverridesContext,
-	);
+	const dragOverrides = Internals.useDragOverridesForNodePath(nodePath);
 	const propStatusesForOverride = useMemo(() => {
 		return nodePath
 			? Internals.getPropStatusesCtx(propStatuses, nodePath)
 			: undefined;
 	}, [propStatuses, nodePath]);
-	const volumeDragOverride = useMemo(
-		() => (nodePath ? getDragOverrides(nodePath).volume : undefined),
-		[getDragOverrides, nodePath],
-	);
+	const volumeDragOverride = dragOverrides.volume;
 	const volumeKeyframeStatus = useMemo(() => {
 		if (volumeDragOverride?.type === 'keyframed') {
 			return volumeDragOverride.status;
@@ -970,8 +953,7 @@ const TimelineSequenceInner: React.FC<{
 		isStudioInteractivityEnabled() &&
 		propStatusesForOverride?.durationInFrames?.status === 'static',
 	);
-	// calculateTimeline replaces this rate with the cumulative ancestor rate.
-	const originalSequence = sequences.find((candidate) => candidate.id === s.id);
+	// Read the original rate before calculateTimeline applies ancestor rates.
 	const endField = useRuntimeValueSelector({
 		controls: s.controls,
 		selector: (runtimeValues) =>
@@ -998,11 +980,8 @@ const TimelineSequenceInner: React.FC<{
 		isStudioInteractivityEnabled() &&
 		propStatusesForOverride?.trimBefore?.status === 'static',
 	);
-	const previousCascadingSequenceNodePath = adjacentCascadingSequences.previous
-		?.controls?.overrideId
-		? overrideIdToNodePathMappingsRef.current[
-				adjacentCascadingSequences.previous.controls.overrideId
-			]
+	const previousCascadingSequenceNodePath = previousCascadingOverrideId
+		? overrideIdToNodePathMappingsRef.current[previousCascadingOverrideId]
 		: null;
 	const previousCascadingSequenceCanResize = Boolean(
 		isStudioInteractivityEnabled() &&
@@ -1135,7 +1114,7 @@ const TimelineSequenceInner: React.FC<{
 
 		splitSelectedTimelineItems({
 			selections: selectedItems,
-			sequences,
+			sequences: sequencesRef.current,
 			overrideIdsToNodePaths: overrideIdToNodePathMappingsRef.current,
 			propStatuses,
 			splitFrame: getCurrentFrame(),
@@ -1146,7 +1125,7 @@ const TimelineSequenceInner: React.FC<{
 		propStatuses,
 		selectedItems,
 		selectedSequenceNodePathInfos,
-		sequences,
+		sequencesRef,
 	]);
 	const onDeleteSequenceFromSource = useCallback(() => {
 		if (
@@ -1221,7 +1200,7 @@ const TimelineSequenceInner: React.FC<{
 						getSequencesContextForAgents({
 							nodePathInfos: selectedSequenceNodePathInfos,
 							overrideIdsToNodePaths: overrideIdToNodePathMappingsRef.current,
-							sequences,
+							sequences: sequencesRef.current,
 						}),
 					deleteDisabled: !previewInteractive,
 					duplicateDisabled: !previewInteractive,
@@ -1334,7 +1313,7 @@ const TimelineSequenceInner: React.FC<{
 			selectedItems.length,
 			selectedSequenceNodePathInfos,
 			sequenceFrameOffset,
-			sequences,
+			sequencesRef,
 			setPropStatuses,
 			setSelectedModal,
 			validatedLocation?.source,
@@ -1547,12 +1526,6 @@ const TimelineSequenceInner: React.FC<{
 			return null;
 		}
 
-		const naturalSequenceDuration = originalSequence
-			? getTimelineSequenceNaturalDuration({
-					sequence: originalSequence,
-					sequences,
-				})
-			: null;
 		const trimmedBefore = Math.max(
 			0,
 			isMedia
@@ -1731,14 +1704,14 @@ const TimelineSequenceInner: React.FC<{
 		durationCanResize &&
 		(!isMedia || Boolean(s.loopDisplay) || mediaDurationDragLimits !== null);
 	const isFirstCascadingSequence =
-		isCascadingSequence(s) && adjacentCascadingSequences.previous === null;
+		isCascadingSequence(s) && previousCascadingSequenceId === null;
 	const showLeftEdgeDragHandle =
 		isTimelineSequenceLeftEdgeDraggable(s) &&
 		nodePath !== null &&
 		validatedLocation !== null &&
 		(isFirstCascadingSequence
 			? trimBeforeCanUpdate
-			: adjacentCascadingSequences.previous
+			: previousCascadingSequenceId !== null
 				? previousCascadingSequenceCanResize
 				: fromCanUpdate && durationCanUpdate && trimBeforeCanUpdate);
 	const canShowSecondaryLeftEdgeAction =
